@@ -1,0 +1,182 @@
+name: AnyArch-AppImage
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+on:
+  schedule:
+    - cron: "0 7 1/21 * *"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: "${{ matrix.arch }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64
+          - arm32v7
+          - ppc64
+          #- ppc64le
+          #- pentium4
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+            image: ghcr.io/pkgforge-dev/archlinux:latest
+          - arch: aarch64
+            platform: linux/arm64
+            image: danhunsaker/archlinuxarm:latest
+          - arch: arm32v7
+            platform: linux/arm/v7
+            image: danhunsaker/archlinuxarm:latest
+          - arch: ppc64
+            platform: linux/ppc64
+            image: kth5/archpower:latest-ppc64
+            entrypoint: /bin/sh
+          #- arch: ppc64le
+          #  platform: linux/ppc64le
+          #  image: kth5/archpower:latest-ppc64le
+          #- arch: pentium4
+          #  image: jonathonf/archlinux32:pentium4
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Register QEMU binfmt (ppc64 only)
+        if: matrix.arch == 'ppc64'
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build in container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e GITHUB_REPOSITORY="${{ github.repository }}" \
+            -e MATRIX_ARCH="${{ matrix.arch }}" \
+            ${{ matrix.platform && format('--platform {0}', matrix.platform) || '' }} \
+            ${{ matrix.entrypoint && format('--entrypoint {0}', matrix.entrypoint) || '' }} \
+            ${{ matrix.image }} \
+            ${{ matrix.entrypoint && '-c' || 'sh -c' }} "
+              # Disable pacman sandbox (Landlock unavailable under QEMU)
+              sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf 2>/dev/null || \
+                echo 'DisableSandbox' >> /etc/pacman.conf
+              sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf 2>/dev/null || true
+              # Per-arch tuning (use MATRIX_ARCH since uname -m may lie under QEMU)
+              case \"\$MATRIX_ARCH\" in
+                pentium4)
+                  printf '%s\n' 'Server = https://mirror.math.princeton.edu/pub/archlinux32/pentium4/\$repo' \
+                    'SigLevel = Never' > /etc/pacman.d/mirrorlist
+                  sed -i 's/^CFLAGS=.*/CFLAGS=\"-march=pentium4 -mtune=pentium4 -O2 -pipe -fstack-protector-strong -fno-plt\"/' /etc/makepkg.conf 2>/dev/null || true
+                  sed -i 's/^CXXFLAGS=.*/CXXFLAGS=\"-march=pentium4 -mtune=pentium4 -O2 -pipe -fstack-protector-strong -fno-plt\"/' /etc/makepkg.conf 2>/dev/null || true
+                  pacman-key --init 2>/dev/null || true
+                  pacman-key --populate archlinux32 2>/dev/null || true
+                  ;;
+                ppc64)
+                  printf '%s\n' '[extrappc-any]' 'SigLevel = Never' \
+                    'Server = https://raw.githubusercontent.com/Link4Electronics/archpower-packages/main/extrappc/any' \
+                    '' '[extrappc]' 'SigLevel = Never' \
+                    'Server = https://raw.githubusercontent.com/Link4Electronics/archpower-packages/main/extrappc/\$arch' \
+                    >> /etc/pacman.conf
+                  pacman-key --init 2>/dev/null || true
+                  pacman -S --noconfirm archpower-keyring 2>/dev/null || true
+                  pacman -Sy --noconfirm 2>/dev/null || true
+                  # Accept repo versions (downgrade from image's newer pkgs) in one
+                  # consistent transaction. Partial --ignore causes version mismatch
+                  # that leads to segfaults under QEMU.
+                  SKIP_UPGRADE=1
+                  pkgs='base-devel git jq patchelf strace wget zsync unzip 7zip \
+                    freetype2 libx11 libxrandr libxss nspr nss nss-mdns \
+                    pulseaudio pulseaudio-alsa xorg-server-xvfb'
+                  ;;
+                *)
+                  pacman-key --init 2>/dev/null || true
+                  pkgs='base-devel git jq patchelf strace wget zsync unzip 7zip \
+                    freetype2 libx11 libxrandr libxss nspr nss nss-mdns \
+                    pulseaudio pulseaudio-alsa xorg-server-xvfb'
+                  ;;
+              esac
+              if [ -z \"\${SKIP_UPGRADE:-}\" ]; then
+                pacman -Sy --noconfirm 2>/dev/null || true
+                pacman -S --noconfirm archlinux-keyring 2>/dev/null || true
+                pacman -Su --noconfirm 2>/dev/null || true
+              fi
+              # Add curl to main pkgs so it downgrades in the first transaction
+              # alongside deps, avoiding a hung second transaction under QEMU.
+              pkgs=\"\$pkgs curl\"
+              if ! pacman -S --noconfirm \$PACMAN_IGNORE \$pkgs; then
+                echo 'Normal install failed under QEMU, trying download+extract...'
+                pacman -Sw --noconfirm \$PACMAN_IGNORE \$pkgs || true
+                for pkg in /var/cache/pacman/pkg/*.pkg.tar.*; do
+                  [ -f \"\$pkg\" ] && tar --zstd -xf \"\$pkg\" -C / 2>/dev/null || tar -xf \"\$pkg\" -C / 2>/dev/null || true
+                done
+                ldconfig 2>/dev/null || true
+              fi
+              # Ensure nettle/wget/curl are consistent (QEMU DB workaround)
+              pacman -S --noconfirm nettle wget curl 2>/dev/null || true
+              ldconfig 2>/dev/null || true
+              # Download quick-sharun (try each method independently)
+              if command -v busybox >/dev/null 2>&1; then
+                busybox wget -q 'https://raw.githubusercontent.com/Link4Electronics/AnyArch-AppImages/main/useful-tools/quick-sharun.sh' \
+                  -O /usr/local/bin/quick-sharun 2>/dev/null || true
+              fi
+              if [ ! -s /usr/local/bin/quick-sharun ] && command -v curl >/dev/null 2>&1; then
+                curl -sLo /usr/local/bin/quick-sharun \
+                  'https://raw.githubusercontent.com/Link4Electronics/AnyArch-AppImages/main/useful-tools/quick-sharun.sh' || true
+              fi
+              if [ ! -s /usr/local/bin/quick-sharun ] && command -v wget >/dev/null 2>&1; then
+                wget -q 'https://raw.githubusercontent.com/Link4Electronics/AnyArch-AppImages/main/useful-tools/quick-sharun.sh' \
+                  -O /usr/local/bin/quick-sharun || true
+              fi
+              chmod +x /usr/local/bin/quick-sharun 2>/dev/null || true
+              echo Architecture: \$(uname -m)
+              /bin/sh ./get-dependencies.sh
+              /bin/sh ./make-appimage.sh
+            "
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppImage-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: warn
+
+  release:
+    if: ${{ github.ref_name == 'main' }}
+    needs: [build]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+          pattern: AppImage-*
+          merge-multiple: true
+
+      - name: Collect files
+        run: find /tmp/artifacts -type f -exec cp -v {} . \;
+
+      - name: Release (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release (manual/schedule)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*'
+          tag_name: ${{ github.sha }}
+          name: Build ${{ github.sha }}
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
